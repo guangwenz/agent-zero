@@ -541,12 +541,34 @@ def group_messages_abab(messages: list[BaseMessage]) -> list[BaseMessage]:
     return result
 
 
+def _is_empty_content(content) -> bool:
+    """Check if message content is effectively empty."""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        stripped = content.strip()
+        # empty string, whitespace, empty JSON containers
+        return not stripped or stripped in ('{}', '[]', '""', "''"  )
+    if isinstance(content, dict):
+        return not content  # empty dict
+    if isinstance(content, list):
+        if not content:  # empty list
+            return True
+        # list with only empty text parts and no other content
+        text_items = [item for item in content if isinstance(item, dict) and item.get("type") == "text"]
+        non_text_items = [item for item in content if not (isinstance(item, dict) and item.get("type") == "text")]
+        if text_items and not non_text_items:
+            if all(not (item.get("text", "") or "").strip() for item in text_items):
+                return True
+    return False
+
+
 def output_langchain(messages: list[OutputMessage]):
     result = []
     for m in messages:
         content = _output_content_langchain(content=m["content"])
-        if not content or (isinstance(content, str) and not content.strip()):
-            continue # skip empty messages, models 
+        if _is_empty_content(content):
+            continue  # skip empty messages, models don't accept them
         if m["ai"]:
             result.append(AIMessage(content))  # type: ignore
         else:

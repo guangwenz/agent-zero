@@ -361,6 +361,14 @@ class LiteLLMChatWrapper(SimpleChatModel):
             if tool_call_id:
                 message_dict["tool_call_id"] = tool_call_id
 
+            # Skip messages with empty content to prevent API errors
+            msg_content = message_dict.get("content")
+            if role == "user" and (
+                not msg_content
+                or (isinstance(msg_content, str) and not msg_content.strip())
+                or (isinstance(msg_content, str) and msg_content.strip() in ('{}', '[]', '""'))
+            ):
+                continue
             result.append(message_dict)
 
         if explicit_caching and result:
@@ -592,6 +600,22 @@ class AsyncAIChatReplacement:
 
 from browser_use.llm import ChatOllama, ChatOpenRouter, ChatGoogle, ChatAnthropic, ChatGroq, ChatOpenAI
 
+
+def _fix_schema_additional_properties(schema):
+    """Recursively add additionalProperties: false to all object types in JSON schema.
+    Required by some API providers (e.g., a0_venice/Anthropic via OpenAI-compatible proxy)."""
+    if isinstance(schema, dict):
+        if schema.get('type') == 'object' or 'properties' in schema:
+            if 'additionalProperties' not in schema:
+                schema['additionalProperties'] = False
+        for key, value in schema.items():
+            if isinstance(value, (dict, list)):
+                _fix_schema_additional_properties(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            _fix_schema_additional_properties(item)
+    return schema
+
 class BrowserCompatibleChatWrapper(ChatOpenRouter):
     """
     A wrapper for browser agent that can filter/sanitize messages
@@ -633,8 +657,13 @@ class BrowserCompatibleChatWrapper(ChatOpenRouter):
             kwrgs = {**self._wrapper.kwargs, **kwargs}
 
             # hack from browser-use to fix json schema for gemini (additionalProperties, $defs, $ref)
-            if "response_format" in kwrgs and "json_schema" in kwrgs["response_format"] and model.startswith("gemini/"):
-                kwrgs["response_format"]["json_schema"] = ChatGoogle("")._fix_gemini_schema(kwrgs["response_format"]["json_schema"])
+            if "response_format" in kwrgs and "json_schema" in kwrgs["response_format"]:
+                if model and model.startswith("gemini/"):
+                    kwrgs["response_format"]["json_schema"] = ChatGoogle("")._fix_gemini_schema(kwrgs["response_format"]["json_schema"])
+                else:
+                    # Fix for providers requiring additionalProperties: false (e.g., a0_venice, Anthropic proxy)
+                    if "schema" in kwrgs["response_format"]["json_schema"]:
+                        _fix_schema_additional_properties(kwrgs["response_format"]["json_schema"]["schema"])
 
             resp = await acompletion(
                 model=self._wrapper.model_name,
