@@ -61,6 +61,39 @@ browser_use_monkeypatch.apply()
 
 litellm.modify_params = True # helps fix anthropic tool calls by browser-use
 
+
+class _EmptyUserMessagePatcher(litellm.CustomLogger):  # type: ignore[attr-defined]
+    """LiteLLM pre-call hook that patches any empty user messages.
+
+    litellm.modify_params=True may INSERT empty user messages AFTER our own
+    safety-nets have already run (inside acompletion) to satisfy Claude's
+    alternating turn requirement.  This hook fires at the very last moment
+    before the HTTP request and replaces any empty/missing user content with
+    a safe placeholder, preventing 400 'user messages must have non-empty
+    content' errors.
+    """
+
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict,  # type: ignore[override]
+        cache,
+        data: dict,
+        call_type: str,
+    ) -> dict:
+        msgs = data.get("messages")
+        if isinstance(msgs, list):
+            for m in msgs:
+                if isinstance(m, dict) and m.get("role") == "user":
+                    if _is_empty_user_content(m.get("content")):
+                        m["content"] = "[...]"
+        return data
+
+
+# Register the patcher as a global LiteLLM callback.
+# Guard against duplicate registration (e.g. module reload in dev mode).
+if not any(isinstance(cb, _EmptyUserMessagePatcher) for cb in litellm.callbacks):
+    litellm.callbacks.append(_EmptyUserMessagePatcher())
+
 def _is_empty_user_content(content) -> bool:
     """Return True if message content is effectively empty and would cause API 400 errors."""
     if content is None:
