@@ -84,8 +84,7 @@ class _EmptyUserMessagePatcher(litellm.CustomLogger):  # type: ignore[attr-defin
         if isinstance(msgs, list):
             for m in msgs:
                 if isinstance(m, dict) and m.get("role") == "user":
-                    if _is_empty_user_content(m.get("content")):
-                        m["content"] = "[...]"
+                    m["content"] = _normalize_user_content(m.get("content"))
         return data
 
 
@@ -205,6 +204,10 @@ def _normalize_user_content(content):
             return combined if combined else "[...]"
 
         # Mixed content - keep as list but ensure text parts are proper
+        # CRITICAL: Provider requires at least one text item in content lists.
+        # Image-only lists (no text parts) are rejected as "empty content".
+        if not text_parts and non_text_parts:
+            text_parts = ["[image]"]
         parts = []
         for t in text_parts:
             parts.append({"type": "text", "text": t})
@@ -720,6 +723,23 @@ class LiteLLMChatWrapper(SimpleChatModel):
                 if _sanitized_any:
                     import logging as _logging
                     _logging.getLogger("a0.models").warning("Nuclear sanitizer fixed empty user message(s) before API call")
+
+
+                # Also normalize image-only user messages (no text item in list)
+                for _sm2 in msgs_conv:
+                    if isinstance(_sm2, dict) and _sm2.get("role") == "user":
+                        _c2 = _sm2.get("content")
+                        if isinstance(_c2, list):
+                            _has_text = any(
+                                isinstance(_it, dict) and _it.get("type") == "text" and str(_it.get("text", "")).strip()
+                                for _it in _c2
+                            )
+                            _has_media = any(
+                                isinstance(_it, dict) and _it.get("type") in ("image_url", "image", "file", "audio", "input_image", "input_audio", "input_file")
+                                for _it in _c2
+                            )
+                            if _has_media and not _has_text:
+                                _sm2["content"] = [{"type": "text", "text": "[image]"}] + list(_c2)
 
                 # call model
                 _completion = await acompletion(
