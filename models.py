@@ -130,11 +130,23 @@ def _is_empty_user_content(content) -> bool:
 
 
 def _normalize_user_content(content):
-    """Normalize user content to API-safe shape and guarantee non-empty content."""
+    """Normalize user content to API-safe shape and guarantee non-empty content.
+
+    Key behaviors:
+    - None, empty strings, empty containers → "[...]"
+    - Lists with only text parts → flattened to a single string (provider compatibility)
+    - Lists with mixed content (text + images) → kept as list with empty parts removed
+    - Always returns non-empty content
+    """
     if _is_empty_user_content(content):
         return "[...]"
 
-    # OpenAI-compatible content should be str or list of parts.
+    # Plain string - just strip and ensure non-empty
+    if isinstance(content, str):
+        t = content.strip()
+        return t if t else "[...]"
+
+    # Dict - convert to string representation
     if isinstance(content, dict):
         if content.get('type') == 'text':
             t = str(content.get('text', '')).strip()
@@ -147,40 +159,61 @@ def _normalize_user_content(content):
             txt = str(content).strip()
             return txt if txt else "[...]"
 
+    # List content - process carefully
     if isinstance(content, list):
-        parts = []
+        if not content:
+            return "[...]"
+
+        text_parts = []
+        non_text_parts = []
+
         for item in content:
             if item is None:
                 continue
             if isinstance(item, str):
                 t = item.strip()
                 if t:
-                    parts.append({"type": "text", "text": t})
+                    text_parts.append(t)
                 continue
             if isinstance(item, dict):
                 t = item.get('type')
                 if t == 'text':
                     txt = str(item.get('text', '')).strip()
                     if txt:
-                        parts.append({"type": "text", "text": txt})
+                        text_parts.append(txt)
                 elif t in ('image_url', 'image', 'file', 'audio', 'input_image', 'input_audio', 'input_file'):
-                    parts.append(item)
-                elif item:
-                    parts.append(item)
+                    non_text_parts.append(item)
+                elif item:  # unknown type but non-empty dict
+                    try:
+                        import json
+                        s = json.dumps(item, ensure_ascii=False).strip()
+                        if s and s not in ('{}', '[]'):
+                            text_parts.append(s)
+                    except Exception:
+                        s = str(item).strip()
+                        if s:
+                            text_parts.append(s)
                 continue
+            # Other types
             txt = str(item).strip()
             if txt:
-                parts.append({"type": "text", "text": txt})
+                text_parts.append(txt)
 
+        # If no non-text parts, flatten to a single string for maximum provider compatibility
+        if not non_text_parts:
+            combined = "\n".join(text_parts)
+            return combined if combined else "[...]"
+
+        # Mixed content - keep as list but ensure text parts are proper
+        parts = []
+        for t in text_parts:
+            parts.append({"type": "text", "text": t})
+        parts.extend(non_text_parts)
         return parts if parts else "[...]"
 
-    if isinstance(content, str):
-        t = content.strip()
-        return t if t else "[...]"
-
+    # Fallback for any other type
     txt = str(content).strip()
     return txt if txt else "[...]"
-
 
 class ModelType(Enum):
     CHAT = "Chat"
@@ -637,6 +670,57 @@ class LiteLLMChatWrapper(SimpleChatModel):
         while True:
             got_any_chunk = False
             try:
+                # NUCLEAR SANITIZER: Absolute final check before API call
+                _sanitized_any = False
+                for _si, _sm in enumerate(msgs_conv):
+                    if _sm.get("role") != "user":
+                        continue
+                    _sc = _sm.get("content")
+                    _needs_fix = False
+                    if _sc is None:
+                        _needs_fix = True
+                    elif isinstance(_sc, str):
+                        if not _sc.strip():
+                            _needs_fix = True
+                    elif isinstance(_sc, list):
+                        if not _sc:
+                            _needs_fix = True
+                        else:
+                            # Check if all items are empty text
+                            _has_meaningful = False
+                            for _item in _sc:
+                                if _item is None:
+                                    continue
+                                if isinstance(_item, str):
+                                    if _item.strip():
+                                        _has_meaningful = True
+                                        break
+                                elif isinstance(_item, dict):
+                                    if _item.get("type") == "text":
+                                        if str(_item.get("text", "")).strip():
+                                            _has_meaningful = True
+                                            break
+                                    elif _item.get("type") in ("image_url", "image", "file", "audio", "input_image", "input_audio", "input_file"):
+                                        _has_meaningful = True
+                                        break
+                                    elif _item:
+                                        _has_meaningful = True
+                                        break
+                                elif _item:
+                                    _has_meaningful = True
+                                    break
+                            if not _has_meaningful:
+                                _needs_fix = True
+                    elif isinstance(_sc, dict):
+                        if not _sc:
+                            _needs_fix = True
+                    if _needs_fix:
+                        _sm["content"] = "[...]"
+                        _sanitized_any = True
+                if _sanitized_any:
+                    import logging as _logging
+                    _logging.getLogger("a0.models").warning("Nuclear sanitizer fixed empty user message(s) before API call")
+
                 # call model
                 _completion = await acompletion(
                     model=self.model_name,
@@ -693,13 +777,92 @@ class LiteLLMChatWrapper(SimpleChatModel):
 
             except Exception as e:
                 import asyncio
+                import logging as _logging
+                _log = _logging.getLogger("a0.models")
 
-                # Retry only if no chunks received and error is transient
+                # Special handling for "empty content" 400 errors
+                _err_str = str(e).lower()
+                _is_empty_content_err = (
+                    "400" in _err_str and
+                    ("non-empty content" in _err_str or "must have non-empty" in _err_str or "empty content" in _err_str)
+                )
+
+                if _is_empty_content_err and attempt < max_retries + 2:
+                    _log.error("Empty content 400 error caught (attempt %d). Dumping and fixing...", attempt)
+                    # Dump the offending payload for debugging
+                    try:
+                        import datetime as _dt
+                        import json as _djson
+                        _dbg_path = "/a0/tmp/empty_content_400_debug.log"
+                        with open(_dbg_path, "a") as _dbg_f:
+                            _dbg_f.write("\n=== Empty Content 400 Error at %s (attempt %d) ===\n" % (str(_dt.datetime.now()), attempt))
+                            _dbg_f.write("Error: %s\n" % str(e))
+                            _dbg_f.write("Model: %s\n" % self.model_name)
+                            _dbg_f.write("Total messages: %d\n\n" % len(msgs_conv))
+                            for _idx, _msg in enumerate(msgs_conv):
+                                _dbg_f.write("--- Message %d ---\n" % _idx)
+                                _dbg_f.write("Role: %s\n" % _msg.get("role"))
+                                _c = _msg.get("content")
+                                _dbg_f.write("Content type: %s\n" % type(_c).__name__)
+                                _dbg_f.write("Content repr: %s\n" % repr(_c)[:1000])
+                                if isinstance(_c, str):
+                                    _dbg_f.write("Len: %d, stripped: %d, empty: %s\n" % (len(_c), len(_c.strip()), str(not _c.strip())))
+                                elif isinstance(_c, list):
+                                    _dbg_f.write("List len: %d\n" % len(_c))
+                                    for _li, _litem in enumerate(_c):
+                                        _dbg_f.write("  [%d] %s: %s\n" % (_li, type(_litem).__name__, repr(_litem)[:300]))
+                                elif _c is None:
+                                    _dbg_f.write("NONE!\n")
+                                _dbg_f.write("\n")
+                    except Exception:
+                        pass
+
+                    # AGGRESSIVE FIX: sanitize ALL messages
+                    for _sm in msgs_conv:
+                        _sc = _sm.get("content")
+                        _role = _sm.get("role", "")
+                        _fix = False
+                        if _sc is None:
+                            _fix = True
+                        elif isinstance(_sc, str):
+                            if not _sc.strip():
+                                _fix = True
+                        elif isinstance(_sc, list):
+                            if not _sc:
+                                _fix = True
+                            else:
+                                _texts = []
+                                _has_media = False
+                                for _item in _sc:
+                                    if isinstance(_item, dict):
+                                        if _item.get("type") == "text":
+                                            _t = str(_item.get("text", "")).strip()
+                                            if _t:
+                                                _texts.append(_t)
+                                        elif _item.get("type") in ("image_url", "image", "file", "audio", "input_image"):
+                                            _has_media = True
+                                    elif isinstance(_item, str) and _item.strip():
+                                        _texts.append(_item.strip())
+                                if not _texts and not _has_media:
+                                    _fix = True
+                                elif not _has_media:
+                                    _sm["content"] = "\n".join(_texts)
+                        elif isinstance(_sc, dict):
+                            if not _sc:
+                                _fix = True
+                        if _fix:
+                            _sm["content"] = "[...]"
+                            _log.warning("Fixed empty %s message content on retry", _role)
+
+                    attempt += 1
+                    await asyncio.sleep(retry_delay_s)
+                    continue
+
+                # Standard retry logic for transient errors
                 if got_any_chunk or not _is_transient_litellm_error(e) or attempt >= max_retries:
                     raise
                 attempt += 1
                 await asyncio.sleep(retry_delay_s)
-
 
 class AsyncAIChatReplacement:
     class _Completions:
