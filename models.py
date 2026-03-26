@@ -61,6 +61,94 @@ browser_use_monkeypatch.apply()
 
 litellm.modify_params = True # helps fix anthropic tool calls by browser-use
 
+def _is_empty_user_content(content) -> bool:
+    """Return True if message content is effectively empty and would cause API 400 errors."""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        stripped = content.strip()
+        return (not stripped) or (stripped in ('{}', '[]', '""', "''"))
+    if isinstance(content, dict):
+        if not content:
+            return True
+        if content.get('type') == 'text':
+            return not str(content.get('text', '')).strip()
+        return False
+    if isinstance(content, list):
+        if not content:
+            return True
+        def meaningful(item):
+            if item is None:
+                return False
+            if isinstance(item, str):
+                return bool(item.strip())
+            if isinstance(item, dict):
+                if not item:
+                    return False
+                t = item.get('type')
+                if t == 'text':
+                    return bool(str(item.get('text', '')).strip())
+                if t in ('image_url', 'image', 'file', 'audio'):
+                    return True  # non-text content is always meaningful
+                return True  # unknown type, assume meaningful
+            return bool(item)
+        return not any(meaningful(i) for i in content)
+    return False
+
+
+def _normalize_user_content(content):
+    """Normalize user content to API-safe shape and guarantee non-empty content."""
+    if _is_empty_user_content(content):
+        return "[...]"
+
+    # OpenAI-compatible content should be str or list of parts.
+    if isinstance(content, dict):
+        if content.get('type') == 'text':
+            t = str(content.get('text', '')).strip()
+            return t if t else "[...]"
+        try:
+            import json
+            txt = json.dumps(content, ensure_ascii=False)
+            return txt if txt.strip() else "[...]"
+        except Exception:
+            txt = str(content).strip()
+            return txt if txt else "[...]"
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                t = item.strip()
+                if t:
+                    parts.append({"type": "text", "text": t})
+                continue
+            if isinstance(item, dict):
+                t = item.get('type')
+                if t == 'text':
+                    txt = str(item.get('text', '')).strip()
+                    if txt:
+                        parts.append({"type": "text", "text": txt})
+                elif t in ('image_url', 'image', 'file', 'audio', 'input_image', 'input_audio', 'input_file'):
+                    parts.append(item)
+                elif item:
+                    parts.append(item)
+                continue
+            txt = str(item).strip()
+            if txt:
+                parts.append({"type": "text", "text": txt})
+
+        return parts if parts else "[...]"
+
+    if isinstance(content, str):
+        t = content.strip()
+        return t if t else "[...]"
+
+    txt = str(content).strip()
+    return txt if txt else "[...]"
+
+
 class ModelType(Enum):
     CHAT = "Chat"
     EMBEDDING = "Embedding"
@@ -361,14 +449,9 @@ class LiteLLMChatWrapper(SimpleChatModel):
             if tool_call_id:
                 message_dict["tool_call_id"] = tool_call_id
 
-            # Skip messages with empty content to prevent API errors
-            msg_content = message_dict.get("content")
-            if role == "user" and (
-                not msg_content
-                or (isinstance(msg_content, str) and not msg_content.strip())
-                or (isinstance(msg_content, str) and msg_content.strip() in ('{}', '[]', '""'))
-            ):
-                continue
+            # Normalize user content to API-safe non-empty shape
+            if role == "user":
+                message_dict["content"] = _normalize_user_content(message_dict.get("content"))
             result.append(message_dict)
 
         if explicit_caching and result:
@@ -497,6 +580,11 @@ class LiteLLMChatWrapper(SimpleChatModel):
 
         # convert to litellm format
         msgs_conv = self._convert_messages(messages, explicit_caching=explicit_caching)
+
+        # Safety net: normalize all user messages again right before API call
+        for _m in msgs_conv:
+            if _m.get("role") == "user":
+                _m["content"] = _normalize_user_content(_m.get("content"))
 
         # Apply rate limiting if configured
         limiter = await apply_rate_limiter(
